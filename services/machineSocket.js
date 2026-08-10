@@ -1,877 +1,822 @@
+const WebSocket = require("ws");
+
 const {
-  getMachine: getMachineFromDb,
-  createMachine,
-  updateMachine: updateMachineInDb,
-  isMachineOwner,
-  getMachinesByOwner,
-  deleteMachine,
-  generatePairingCode,
-} = require("./machineRepository");
+  verifyMachine,
+} = require("./machineAuth");
+
+const {
+  registerMachine,
+  disconnectMachine,
+  markCommandAck,
+  updateMachineState,
+  createMachinePairingCode,
+} = require("./machineService");
 
 
 // ========================================
-// RUNTIME MACHINE STATE
-// ========================================
-
-const machines = new Map();
-
-
-// ========================================
-// GET MACHINE
-// ========================================
-
-function getMachine(machineId) {
-
-  return (
-    machines.get(machineId) ||
-    null
-  );
-
-}
-
-
-// ========================================
-// GET ALL RUNTIME MACHINES
-// ========================================
-
-function getAllMachines() {
-
-  return Array.from(
-    machines.values()
-  );
-
-}
-
-
-// ========================================
-// GET MACHINE FROM FIRESTORE
-// ========================================
-
-async function getMachineDetails(
-  machineId
-) {
-
-  return await getMachineFromDb(
-    machineId
-  );
-
-}
-
-
-// ========================================
-// REGISTER / CONNECT MACHINE
-// ========================================
-
-function registerMachine(
-  machineId
-) {
-
-  if (!machineId) {
-
-    throw new Error(
-      "machineId is required"
-    );
-
-  }
-
-
-  let machine =
-    machines.get(machineId);
-
-
-  if (!machine) {
-
-    machine = {
-
-      connected:
-        true,
-
-      machineId,
-
-      status:
-        "idle",
-
-      dispatcherReady:
-        false,
-
-      sawReady:
-        false,
-
-      firmwareVersion:
-        null,
-
-      machineState:
-        null,
-
-      emergency:
-        false,
-
-      lastMachineStateAt:
-        null,
-
-      lastCommand:
-        null,
-
-      lastCommandStatus:
-        null,
-
-      lastCommandAt:
-        null,
-
-      lastAck:
-        null,
-
-      lastAckAt:
-        null,
-
-    };
-
-  } else {
-
-    machine.connected =
-      true;
-
-    machine.status =
-      "idle";
-
-  }
-
-
-  machines.set(
-    machineId,
-    machine
-  );
-
-
-  return {
-    ...machine,
-  };
-
-}
-
-
-// ========================================
-// UPDATE MACHINE STATE
+// MULTI-MACHINE CONNECTION REGISTRY
 // ========================================
 //
-// IMPORTANT:
-// This function writes to Firestore only when
-// the caller has detected an actual state change.
-// The RPi agent already prevents duplicate states.
+// KEY = ACTUAL ESP32 MACHINE ID
+//
+// Example:
+//
+// D885D1ABC31C -> WebSocket
+// ABC123456789 -> WebSocket
+//
+// One machine cannot receive
+// another machine's command.
 //
 
-async function updateMachineState(
+const machineConnections =
+  new Map();
+
+
+// ========================================
+// SETUP MACHINE WEBSOCKET
+// ========================================
+
+function setupMachineSocket(server) {
+
+  const wss =
+    new WebSocket.Server({
+
+      server,
+
+      path:
+        "/machine",
+
+    });
+
+
+  wss.on(
+    "connection",
+    (ws) => {
+
+      console.log(
+        "🔌 Incoming machine connection"
+      );
+
+
+      let authenticated =
+        false;
+
+      let listenerId =
+        null;
+
+      let machineId =
+        null;
+
+
+      // ====================================
+      // AUTH TIMEOUT
+      // ====================================
+
+      const authTimeout =
+        setTimeout(
+          () => {
+
+            if (!authenticated) {
+
+              console.log(
+                "❌ Machine authentication timeout"
+              );
+
+              try {
+                ws.close();
+              } catch (_) {}
+
+            }
+
+          },
+          10000
+        );
+
+
+      // ====================================
+      // MESSAGE
+      // ====================================
+
+      ws.on(
+        "message",
+        async (message) => {
+
+          try {
+
+            const data =
+              JSON.parse(
+                message.toString()
+              );
+
+
+            console.log(
+              "📡 Machine message:",
+              data
+            );
+
+
+            // ==================================
+            // AUTHENTICATION
+            // ==================================
+
+            if (
+              data.type ===
+              "listener"
+            ) {
+
+              listenerId =
+                data.listenerId ||
+                null;
+
+
+              const requestedMachineId =
+                data.machineId ||
+                null;
+
+
+              // --------------------------------
+              // LISTENER ID
+              // --------------------------------
+
+              if (!listenerId) {
+
+                ws.send(
+                  JSON.stringify({
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "listenerId is required",
+
+                  })
+                );
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              // --------------------------------
+              // MACHINE ID
+              // --------------------------------
+
+              if (!requestedMachineId) {
+
+                ws.send(
+                  JSON.stringify({
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "ESP32 machineId is required",
+
+                  })
+                );
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              // --------------------------------
+              // VERIFY LISTENER
+              // --------------------------------
+
+              const valid =
+                verifyMachine(
+                  listenerId,
+                  data.secret
+                );
+
+
+              if (!valid) {
+
+                console.log(
+                  "❌ Machine authentication failed:",
+                  listenerId
+                );
+
+
+                ws.send(
+                  JSON.stringify({
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "Machine authentication failed",
+
+                  })
+                );
+
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              // =================================
+              // AUTHENTICATED
+              // =================================
+
+              authenticated =
+                true;
+
+
+              clearTimeout(
+                authTimeout
+              );
+
+
+              // =================================
+              // ACTUAL ESP32 ID
+              // =================================
+
+              machineId =
+                requestedMachineId;
+
+
+              console.log(
+                "🔐 Listener authenticated:",
+                listenerId
+              );
+
+              console.log(
+                "🆔 ESP32 Machine ID:",
+                machineId
+              );
+
+
+              // =================================
+              // DUPLICATE CONNECTION
+              // =================================
+
+              const existingConnection =
+                machineConnections.get(
+                  machineId
+                );
+
+
+              if (
+                existingConnection &&
+                existingConnection !== ws
+              ) {
+
+                console.log(
+                  `⚠️ Existing connection found for ${machineId}`
+                );
+
+
+                try {
+
+                  existingConnection.close();
+
+                } catch (error) {
+
+                  console.error(
+                    "❌ Failed to close old connection:",
+                    error.message
+                  );
+
+                }
+
+              }
+
+
+              // =================================
+              // REGISTER CONNECTION
+              // =================================
+
+              machineConnections.set(
+                machineId,
+                ws
+              );
+
+
+              // =================================
+              // REGISTER RUNTIME MACHINE
+              // =================================
+
+              const machine =
+                registerMachine(
+                  machineId
+                );
+
+
+              console.log(
+                "✅ Machine registered:",
+                machineId
+              );
+
+
+              // =================================
+              // GENERATE PAIRING CODE
+              // =================================
+
+              let pairing =
+                null;
+
+
+              try {
+
+                pairing =
+                  await createMachinePairingCode(
+                    machineId
+                  );
+
+
+                console.log(
+                  "🔐 Pairing information:",
+                  pairing
+                );
+
+              } catch (error) {
+
+                console.error(
+                  "⚠️ Pairing code generation failed:",
+                  error.message
+                );
+
+              }
+
+
+              // =================================
+              // AUTH SUCCESS
+              // =================================
+
+              const authResponse = {
+
+                type:
+                  "auth_success",
+
+                message:
+                  "Machine authenticated successfully",
+
+                machineId,
+
+                listenerId,
+
+                paired:
+                  pairing
+                    ? pairing.paired
+                    : false,
+
+                pairingCode:
+                  pairing
+                    ? pairing.pairingCode
+                    : null,
+
+                pairingCodeCreatedAt:
+                  pairing
+                    ? pairing.pairingCodeCreatedAt
+                    : null,
+
+                expiresIn:
+                  pairing
+                    ? pairing.expiresIn
+                    : 0,
+
+              };
+
+
+              ws.send(
+                JSON.stringify(
+                  authResponse
+                )
+              );
+
+
+              console.log(
+                "📤 Auth success sent"
+              );
+
+
+              return;
+
+            }
+
+
+            // ==================================
+            // BLOCK UNAUTHENTICATED
+            // ==================================
+
+            if (!authenticated) {
+
+              console.log(
+                "⚠️ Unauthenticated message rejected"
+              );
+
+              return;
+
+            }
+
+
+            // ==================================
+            // MACHINE STATE
+            // ==================================
+
+            if (
+              data.type ===
+              "machine_state"
+            ) {
+
+              console.log(
+                `📊 Machine state received: ${machineId}`
+              );
+
+
+              // Force server-owned IDs
+              const stateData = {
+
+                ...data,
+
+                listenerId:
+                  machineId,
+
+                machineId:
+                  machineId,
+
+              };
+
+
+              const state =
+                await updateMachineState(
+                  stateData
+                );
+
+
+              console.log(
+                "🟢 Machine state updated:",
+                state
+              );
+
+
+              return;
+
+            }
+
+
+            // ==================================
+            // COMMAND ACK
+            // ==================================
+
+            if (
+              data.type ===
+              "command_ack"
+            ) {
+
+              console.log(
+                `✅ Command ACK from ${machineId}:`,
+                data
+              );
+
+
+              // Server owns the machine identity.
+              // Never trust client-supplied machine ID.
+
+              const ackData = {
+
+                ...data,
+
+                listenerId:
+                  machineId,
+
+                machineId:
+                  machineId,
+
+              };
+
+
+              const state =
+                await markCommandAck(
+                  ackData
+                );
+
+
+              console.log(
+                "📊 Command ACK updated:",
+                state
+              );
+
+
+              return;
+
+            }
+
+
+            // ==================================
+            // UNKNOWN MESSAGE
+            // ==================================
+
+            console.log(
+              `⚠️ Unknown message from ${machineId}:`,
+              data.type
+            );
+
+          } catch (error) {
+
+            console.error(
+              "❌ Invalid machine message:",
+              error.message
+            );
+
+          }
+
+        }
+      );
+
+
+      // ====================================
+      // CLOSE
+      // ====================================
+
+      ws.on(
+        "close",
+        async () => {
+
+          clearTimeout(
+            authTimeout
+          );
+
+
+          if (!authenticated) {
+
+            console.log(
+              "🔌 Unauthenticated connection closed"
+            );
+
+            return;
+
+          }
+
+
+          console.log(
+            `🔌 Machine disconnected: ${machineId}`
+          );
+
+
+          // Only remove this socket if
+          // it is still the active socket.
+
+          if (
+            machineConnections.get(
+              machineId
+            ) === ws
+          ) {
+
+            machineConnections.delete(
+              machineId
+            );
+
+
+            try {
+
+              await disconnectMachine(
+                machineId
+              );
+
+            } catch (error) {
+
+              console.error(
+                `❌ Failed to update disconnect state [${machineId}]:`,
+                error.message
+              );
+
+            }
+
+          }
+
+        }
+      );
+
+
+      // ====================================
+      // ERROR
+      // ====================================
+
+      ws.on(
+        "error",
+        (error) => {
+
+          console.error(
+            `❌ WebSocket error [${machineId || "unknown"}]:`,
+            error.message
+          );
+
+        }
+      );
+
+    }
+  );
+
+
+  return wss;
+
+}
+
+
+// ========================================
+// SEND TO SPECIFIC MACHINE
+// ========================================
+
+function sendToMachine(
+  machineId,
   data
 ) {
 
-  if (!data) {
-    return null;
-  }
-
-
-  const machineId =
-    data.listenerId ||
-    data.machineId;
-
-
-  if (!machineId) {
-
-    throw new Error(
-      "machineId is required"
-    );
-
-  }
-
-
-  let machine =
-    machines.get(machineId);
-
-
-  if (!machine) {
-
-    registerMachine(
+  const ws =
+    machineConnections.get(
       machineId
     );
 
-    machine =
-      machines.get(machineId);
+
+  if (!ws) {
+
+    console.log(
+      `❌ Machine not connected: ${machineId}`
+    );
+
+    return false;
 
   }
 
 
-  const state =
-    data.state || {};
-
-
-  // ======================================
-  // CONNECTION
-  // ======================================
-
   if (
-    typeof state.connected ===
-    "boolean"
+    ws.readyState !==
+    WebSocket.OPEN
   ) {
 
-    machine.connected =
-      state.connected;
-
-  }
-
-
-  // ======================================
-  // DISPATCHER
-  // ======================================
-
-  if (
-    typeof state.dispatcherReady ===
-    "boolean"
-  ) {
-
-    machine.dispatcherReady =
-      state.dispatcherReady;
-
-  }
-
-
-  // ======================================
-  // SAW
-  // ======================================
-
-  if (
-    typeof state.sawReady ===
-    "boolean"
-  ) {
-
-    machine.sawReady =
-      state.sawReady;
-
-  }
-
-
-  // ======================================
-  // FIRMWARE
-  // ======================================
-
-  if (
-    state.firmwareVersion !==
-    undefined
-  ) {
-
-    machine.firmwareVersion =
-      state.firmwareVersion;
-
-  }
-
-
-  // ======================================
-  // MACHINE STATE
-  // ======================================
-
-  if (
-    state.machineState !==
-    undefined
-  ) {
-
-    machine.machineState =
-      state.machineState;
+    console.log(
+      `❌ Machine WebSocket not open: ${machineId}`
+    );
 
 
     if (
-      state.machineState
+      machineConnections.get(
+        machineId
+      ) === ws
     ) {
 
-      machine.status =
-        String(
-          state.machineState
-        ).toLowerCase();
+      machineConnections.delete(
+        machineId
+      );
 
     }
 
-  }
 
-
-  // ======================================
-  // EMERGENCY
-  // ======================================
-
-  if (
-    typeof state.emergency ===
-    "boolean"
-  ) {
-
-    machine.emergency =
-      state.emergency;
+    return false;
 
   }
 
-
-  // ======================================
-  // TIMESTAMP
-  // ======================================
-
-  machine.lastMachineStateAt =
-    data.timestamp ||
-    new Date().toISOString();
-
-
-  machines.set(
-    machineId,
-    machine
-  );
-
-
-  // ======================================
-  // PERSIST
-  // ======================================
 
   try {
 
-    await updateMachineInDb(
+    // ======================================
+    // SECURITY
+    // SERVER OWNS TARGET MACHINE ID
+    // ======================================
 
-      machineId,
+    const payload = {
 
-      {
+      ...data,
 
-        connected:
-          machine.connected,
+      machineId:
+        machineId,
 
-        status:
-          machine.status,
+    };
 
-        dispatcherReady:
-          machine.dispatcherReady,
 
-        sawReady:
-          machine.sawReady,
-
-        firmwareVersion:
-          machine.firmwareVersion,
-
-        machineState:
-          machine.machineState,
-
-        emergency:
-          machine.emergency,
-
-        lastMachineStateAt:
-          machine.lastMachineStateAt,
-
-      }
-
+    ws.send(
+      JSON.stringify(
+        payload
+      )
     );
+
+
+    console.log(
+      `📤 Data sent to machine: ${machineId}`,
+      payload
+    );
+
+
+    return true;
 
   } catch (error) {
 
     console.error(
-      `⚠️ Failed to persist machine state [${machineId}]:`,
+      `❌ Failed to send data to ${machineId}:`,
       error.message
     );
 
+
+    return false;
+
   }
-
-
-  return {
-    ...machine,
-  };
 
 }
 
 
 // ========================================
-// CREATE MACHINE PAIRING CODE
+// CHECK MACHINE CONNECTION
 // ========================================
-//
-// Called when an ESP32/RPi successfully
-// authenticates with the server.
-//
-// If already paired:
-//     no new code is generated.
-//
-// If unpaired:
-//     generate 6-digit code
-//     save to Firestore
-//     return code to socket
-//
 
-async function createMachinePairingCode(
+function isMachineConnected(
   machineId
 ) {
 
-  if (!machineId) {
-
-    throw new Error(
-      "machineId is required"
-    );
-
-  }
-
-
-  // ======================================
-  // GET MACHINE
-  // ======================================
-
-  const machine =
-    await getMachineFromDb(
+  const ws =
+    machineConnections.get(
       machineId
     );
 
 
-  if (!machine) {
-
-    throw new Error(
-      `Machine not found: ${machineId}`
-    );
-
-  }
-
-
-  // ======================================
-  // ALREADY PAIRED
-  // ======================================
-
-  if (
-    machine.paired === true &&
-    machine.ownerId
-  ) {
-
-    return {
-
-      machineId,
-
-      paired:
-        true,
-
-      pairingCode:
-        null,
-
-      pairingCodeCreatedAt:
-        null,
-
-      expiresIn:
-        0,
-
-    };
-
-  }
-
-
-  // ======================================
-  // GENERATE CODE
-  // ======================================
-
-  const pairingCode =
-    generatePairingCode();
-
-
-  const pairingCodeCreatedAt =
-    new Date().toISOString();
-
-
-  // ======================================
-  // SAVE CODE
-  // ======================================
-
-  await updateMachineInDb(
-
-    machineId,
-
-    {
-
-      pairingCode,
-
-      pairingCodeCreatedAt,
-
-      paired:
-        false,
-
-    }
-
+  return (
+    ws !== undefined &&
+    ws.readyState ===
+    WebSocket.OPEN
   );
-
-
-  console.log(
-    `🔐 Pairing code generated [${machineId}]: ${pairingCode}`
-  );
-
-
-  // ======================================
-  // RETURN
-  // ======================================
-
-  return {
-
-    machineId,
-
-    paired:
-      false,
-
-    pairingCode,
-
-    pairingCodeCreatedAt,
-
-    // 10 minutes
-    expiresIn:
-      600,
-
-  };
 
 }
 
 
 // ========================================
-// COMMAND SENT
+// GET CONNECTED MACHINES
 // ========================================
 
-async function markCommandSent(
-  machineId,
-  command
-) {
+function getConnectedMachines() {
 
-  const machine =
-    machines.get(machineId);
-
-
-  if (!machine) {
-
-    throw new Error(
-      `Machine not found: ${machineId}`
-    );
-
-  }
-
-
-  machine.lastCommand =
-    command;
-
-  machine.lastCommandStatus =
-    "sent";
-
-  machine.lastCommandAt =
-    new Date().toISOString();
-
-
-  machines.set(
-    machineId,
-    machine
+  return Array.from(
+    machineConnections.keys()
   );
-
-
-  try {
-
-    await updateMachineInDb(
-
-      machineId,
-
-      {
-
-        lastCommand:
-          machine.lastCommand,
-
-        lastCommandStatus:
-          machine.lastCommandStatus,
-
-        lastCommandAt:
-          machine.lastCommandAt,
-
-      }
-
-    );
-
-  } catch (error) {
-
-    console.error(
-      `⚠️ Failed to persist command state [${machineId}]:`,
-      error.message
-    );
-
-  }
-
-
-  return {
-    ...machine,
-  };
 
 }
 
 
 // ========================================
-// COMMAND ACK
+// GET CONNECTION COUNT
 // ========================================
 
-async function markCommandAck(
-  data
-) {
+function getConnectionCount() {
 
-  if (!data) {
-
-    throw new Error(
-      "ACK data is required"
-    );
-
-  }
-
-
-  const machineId =
-    data.listenerId ||
-    data.machineId;
-
-
-  if (!machineId) {
-
-    throw new Error(
-      "machineId is required"
-    );
-
-  }
-
-
-  const machine =
-    machines.get(machineId);
-
-
-  if (!machine) {
-
-    throw new Error(
-      `Machine not found: ${machineId}`
-    );
-
-  }
-
-
-  machine.lastAck = {
-
-    command:
-      data.command,
-
-    success:
-      data.success,
-
-    executed:
-      data.executed,
-
-    error:
-      data.error ||
-      null,
-
-  };
-
-
-  machine.lastAckAt =
-    data.timestamp ||
-    new Date().toISOString();
-
-
-  machine.lastCommandStatus =
-    data.success
-      ? "acknowledged"
-      : "failed";
-
-
-  machines.set(
-    machineId,
-    machine
-  );
-
-
-  try {
-
-    await updateMachineInDb(
-
-      machineId,
-
-      {
-
-        lastAck:
-          machine.lastAck,
-
-        lastAckAt:
-          machine.lastAckAt,
-
-        lastCommandStatus:
-          machine.lastCommandStatus,
-
-      }
-
-    );
-
-  } catch (error) {
-
-    console.error(
-      `⚠️ Failed to persist ACK [${machineId}]:`,
-      error.message
-    );
-
-  }
-
-
-  return {
-    ...machine,
-  };
+  return machineConnections.size;
 
 }
 
 
 // ========================================
-// DISCONNECT MACHINE
+// DISCONNECT SPECIFIC MACHINE
 // ========================================
 
-async function disconnectMachine(
+function disconnectMachineSocket(
   machineId
 ) {
 
-  const machine =
-    machines.get(machineId);
+  const ws =
+    machineConnections.get(
+      machineId
+    );
 
 
-  if (!machine) {
-    return null;
+  if (!ws) {
+
+    return false;
+
   }
-
-
-  machine.connected =
-    false;
-
-  machine.status =
-    "offline";
-
-
-  machines.set(
-    machineId,
-    machine
-  );
 
 
   try {
 
-    await updateMachineInDb(
-
-      machineId,
-
-      {
-
-        connected:
-          false,
-
-        status:
-          "offline",
-
-      }
-
-    );
+    ws.close();
 
   } catch (error) {
 
     console.error(
-      `⚠️ Failed to persist disconnect [${machineId}]:`,
+      `❌ Failed to close ${machineId}:`,
       error.message
     );
 
   }
 
 
-  return {
-    ...machine,
-  };
+  if (
+    machineConnections.get(
+      machineId
+    ) === ws
+  ) {
 
-}
-
-
-// ========================================
-// CREATE MACHINE FOR USER
-// ========================================
-
-async function createUserMachine(
-  machineId,
-  ownerId,
-  name
-) {
-
-  return await createMachine(
-
-    machineId,
-
-    ownerId,
-
-    name
-
-  );
-
-}
-
-
-// ========================================
-// CHECK MACHINE OWNERSHIP
-// ========================================
-
-async function checkMachineOwnership(
-  machineId,
-  ownerId
-) {
-
-  return await isMachineOwner(
-
-    machineId,
-
-    ownerId
-
-  );
-
-}
-
-
-// ========================================
-// GET USER MACHINES
-// ========================================
-
-async function getUserMachines(
-  ownerId
-) {
-
-  return await getMachinesByOwner(
-    ownerId
-  );
-
-}
-
-
-// ========================================
-// DELETE USER MACHINE
-// ========================================
-
-async function deleteUserMachine(
-  machineId,
-  ownerId
-) {
-
-  const owner =
-    await isMachineOwner(
-
-      machineId,
-
-      ownerId
-
-    );
-
-
-  if (!owner) {
-
-    throw new Error(
-      "Machine ownership verification failed"
+    machineConnections.delete(
+      machineId
     );
 
   }
-
-
-  // Remove runtime state
-  machines.delete(
-    machineId
-  );
-
-
-  // Remove Firestore record
-  await deleteMachine(
-    machineId
-  );
 
 
   return true;
@@ -885,30 +830,16 @@ async function deleteUserMachine(
 
 module.exports = {
 
-  getMachine,
+  setupMachineSocket,
 
-  getAllMachines,
+  sendToMachine,
 
-  getMachineDetails,
+  isMachineConnected,
 
-  registerMachine,
+  getConnectedMachines,
 
-  updateMachineState,
+  getConnectionCount,
 
-  createMachinePairingCode,
-
-  markCommandSent,
-
-  markCommandAck,
-
-  disconnectMachine,
-
-  createUserMachine,
-
-  checkMachineOwnership,
-
-  getUserMachines,
-
-  deleteUserMachine,
+  disconnectMachineSocket,
 
 };
