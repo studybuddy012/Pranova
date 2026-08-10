@@ -28,6 +28,62 @@ async function getMachine(machineId) {
 
 }
 
+// ========================================
+// GENERATE 6-DIGIT PAIRING CODE
+// ========================================
+
+function generatePairingCode() {
+
+  return String(
+    Math.floor(
+      100000 +
+      Math.random() * 900000
+    )
+  );
+
+}
+
+
+// ========================================
+// SET PAIRING CODE
+// ========================================
+
+async function setPairingCode(
+  machineId,
+  pairingCode
+) {
+
+  const machine =
+    await getMachine(machineId);
+
+  if (!machine) {
+
+    throw new Error(
+      `Machine not found: ${machineId}`
+    );
+
+  }
+
+  await updateMachine(
+    machineId,
+    {
+      pairingCode:
+        pairingCode,
+
+      pairingCodeCreatedAt:
+        new Date().toISOString(),
+
+      paired:
+        false,
+
+      ownerId:
+        null,
+    }
+  );
+
+  return true;
+
+}
 
 // ========================================
 // CREATE MACHINE
@@ -242,5 +298,7 @@ module.exports = {
   getMachinesByOwner,
 
   deleteMachine,
+  generatePairingCode,
+  setPairingCode,
 
 };
