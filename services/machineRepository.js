@@ -15,18 +15,16 @@ async function getMachine(machineId) {
       .doc(machineId)
       .get();
 
-
   if (!doc.exists) {
     return null;
   }
-
 
   return {
     machineId: doc.id,
     ...doc.data(),
   };
-
 }
+
 
 // ========================================
 // GENERATE 6-DIGIT PAIRING CODE
@@ -53,37 +51,37 @@ async function setPairingCode(
   pairingCode
 ) {
 
-  const machine =
-    await getMachine(machineId);
-
-  if (!machine) {
-
+  if (!machineId) {
     throw new Error(
-      `Machine not found: ${machineId}`
+      "machineId is required"
     );
+  }
 
+  if (!pairingCode) {
+    throw new Error(
+      "pairingCode is required"
+    );
   }
 
   await updateMachine(
     machineId,
     {
-      pairingCode:
-        pairingCode,
+
+      pairingCode,
 
       pairingCodeCreatedAt:
         new Date().toISOString(),
 
-      paired:
-        false,
+      paired: false,
 
-      ownerId:
-        null,
     }
   );
 
-  return true;
-
+  return getMachine(
+    machineId
+  );
 }
+
 
 // ========================================
 // CREATE MACHINE
@@ -91,32 +89,24 @@ async function setPairingCode(
 
 async function createMachine(
   machineId,
-  ownerId,
+  ownerId = null,
   name = "AlphaCut Machine"
 ) {
 
   if (!machineId) {
+
     throw new Error(
       "machineId is required"
     );
+
   }
-
-
-  if (!ownerId) {
-    throw new Error(
-      "ownerId is required"
-    );
-  }
-
 
   const machineRef =
     machinesCollection
       .doc(machineId);
 
-
   const existing =
     await machineRef.get();
-
 
   if (existing.exists) {
 
@@ -126,6 +116,8 @@ async function createMachine(
 
   }
 
+  const now =
+    new Date().toISOString();
 
   const machine = {
 
@@ -134,6 +126,13 @@ async function createMachine(
     ownerId,
 
     name,
+
+    paired:
+      ownerId !== null,
+
+    pairingCode: null,
+
+    pairingCodeCreatedAt: null,
 
     connected: false,
 
@@ -149,11 +148,9 @@ async function createMachine(
 
     emergency: false,
 
-    createdAt:
-      new Date().toISOString(),
+    createdAt: now,
 
-    updatedAt:
-      new Date().toISOString(),
+    updatedAt: now,
 
   };
 
@@ -162,9 +159,7 @@ async function createMachine(
     machine
   );
 
-
   return machine;
-
 }
 
 
@@ -177,6 +172,22 @@ async function updateMachine(
   updates
 ) {
 
+  if (!machineId) {
+
+    throw new Error(
+      "machineId is required"
+    );
+
+  }
+
+  if (!updates) {
+
+    throw new Error(
+      "updates are required"
+    );
+
+  }
+
   const machineRef =
     machinesCollection
       .doc(machineId);
@@ -185,6 +196,7 @@ async function updateMachine(
   await machineRef.set(
 
     {
+
       ...updates,
 
       updatedAt:
@@ -202,7 +214,6 @@ async function updateMachine(
   return getMachine(
     machineId
   );
-
 }
 
 
@@ -215,22 +226,23 @@ async function isMachineOwner(
   ownerId
 ) {
 
+  if (!machineId || !ownerId) {
+    return false;
+  }
+
   const machine =
     await getMachine(
       machineId
     );
 
-
   if (!machine) {
     return false;
   }
-
 
   return (
     machine.ownerId ===
     ownerId
   );
-
 }
 
 
@@ -241,6 +253,10 @@ async function isMachineOwner(
 async function getMachinesByOwner(
   ownerId
 ) {
+
+  if (!ownerId) {
+    return [];
+  }
 
   const snapshot =
     await machinesCollection
@@ -262,7 +278,6 @@ async function getMachinesByOwner(
 
     })
   );
-
 }
 
 
@@ -274,10 +289,19 @@ async function deleteMachine(
   machineId
 ) {
 
+  if (!machineId) {
+
+    throw new Error(
+      "machineId is required"
+    );
+
+  }
+
   await machinesCollection
     .doc(machineId)
     .delete();
 
+  return true;
 }
 
 
@@ -289,6 +313,10 @@ module.exports = {
 
   getMachine,
 
+  generatePairingCode,
+
+  setPairingCode,
+
   createMachine,
 
   updateMachine,
@@ -298,7 +326,5 @@ module.exports = {
   getMachinesByOwner,
 
   deleteMachine,
-  generatePairingCode,
-  setPairingCode,
 
 };
