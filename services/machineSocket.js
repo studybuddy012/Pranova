@@ -1,6 +1,14 @@
 const WebSocket = require("ws");
 
 const {
+  getAuth,
+} = require("firebase-admin/auth");
+
+const {
+  firebaseApp,
+} = require("./firebase");
+
+const {
   verifyMachine,
 } = require("./machineAuth");
 
@@ -10,33 +18,259 @@ const {
   markCommandAck,
   updateMachineState,
   createMachinePairingCode,
+  checkMachineOwnership,
 } = require("./machineService");
 
 
 // ========================================
-// MULTI-MACHINE CONNECTION REGISTRY
+// FIREBASE AUTH
+// ========================================
+
+const firebaseAuth =
+  getAuth(firebaseApp);
+
+
+// ========================================
+// MACHINE CONNECTIONS
 // ========================================
 //
 // KEY = ACTUAL ESP32 MACHINE ID
 //
-// Example:
+// D885D1ABC31C -> RPi WebSocket
 //
-// D885D1ABC31C -> WebSocket
-// ABC123456789 -> WebSocket
-//
-// One machine cannot receive
-// another machine's command.
-//
+// ========================================
 
 const machineConnections =
   new Map();
 
 
 // ========================================
+// WEBSITE CONNECTIONS
+// ========================================
+//
+// KEY = MACHINE ID
+//
+// Multiple website tabs/users can watch
+// a machine, so value is a Set.
+//
+// D885D1ABC31C
+//      ↓
+// Set(
+//   websiteSocket1,
+//   websiteSocket2
+// )
+//
+// ========================================
+
+const websiteConnections =
+  new Map();
+
+
+// ========================================
+// HELPER
+// ========================================
+
+function sendJson(
+  ws,
+  data
+) {
+
+  if (
+    !ws ||
+    ws.readyState !==
+      WebSocket.OPEN
+  ) {
+
+    return false;
+
+  }
+
+  try {
+
+    ws.send(
+      JSON.stringify(data)
+    );
+
+    return true;
+
+  } catch (error) {
+
+    console.error(
+      "❌ WebSocket send failed:",
+      error.message
+    );
+
+    return false;
+
+  }
+
+}
+
+
+// ========================================
+// BROADCAST TO WEBSITE
+// ========================================
+
+function broadcastToWebsite(
+  machineId,
+  data
+) {
+
+  const clients =
+    websiteConnections.get(
+      machineId
+    );
+
+
+  if (!clients) {
+
+    return 0;
+
+  }
+
+
+  let sentCount = 0;
+
+
+  for (
+    const ws of clients
+  ) {
+
+    if (
+      ws.readyState ===
+      WebSocket.OPEN
+    ) {
+
+      try {
+
+        ws.send(
+          JSON.stringify({
+
+            ...data,
+
+            machineId,
+
+          })
+        );
+
+        sentCount++;
+
+      } catch (error) {
+
+        console.error(
+          `❌ Website broadcast failed [${machineId}]:`,
+          error.message
+        );
+
+      }
+
+    }
+
+  }
+
+
+  return sentCount;
+
+}
+
+
+// ========================================
+// ADD WEBSITE CONNECTION
+// ========================================
+
+function addWebsiteConnection(
+  machineId,
+  ws
+) {
+
+  let clients =
+    websiteConnections.get(
+      machineId
+    );
+
+
+  if (!clients) {
+
+    clients =
+      new Set();
+
+    websiteConnections.set(
+      machineId,
+      clients
+    );
+
+  }
+
+
+  clients.add(
+    ws
+  );
+
+
+  console.log(
+    `🌐 Website connected to machine: ${machineId}`
+  );
+
+  console.log(
+    `🌐 Website viewers: ${clients.size}`
+  );
+
+}
+
+
+// ========================================
+// REMOVE WEBSITE CONNECTION
+// ========================================
+
+function removeWebsiteConnection(
+  machineId,
+  ws
+) {
+
+  const clients =
+    websiteConnections.get(
+      machineId
+    );
+
+
+  if (!clients) {
+
+    return;
+
+  }
+
+
+  clients.delete(
+    ws
+  );
+
+
+  if (
+    clients.size ===
+    0
+  ) {
+
+    websiteConnections.delete(
+      machineId
+    );
+
+  }
+
+
+  console.log(
+    `🌐 Website disconnected from machine: ${machineId}`
+  );
+
+}
+
+
+// ========================================
 // SETUP MACHINE WEBSOCKET
 // ========================================
 
-function setupMachineSocket(server) {
+function setupMachineSocket(
+  server
+) {
 
   const wss =
     new WebSocket.Server({
@@ -54,36 +288,56 @@ function setupMachineSocket(server) {
     (ws) => {
 
       console.log(
-        "🔌 Incoming machine connection"
+        "🔌 Incoming WebSocket connection"
       );
 
 
+      // ==================================
+      // CONNECTION TYPE
+      // ==================================
+
+      let connectionType =
+        null;
+
+
+      // machine | website
       let authenticated =
         false;
 
+
       let listenerId =
         null;
+
 
       let machineId =
         null;
 
 
-      // ====================================
+      let websiteUserId =
+        null;
+
+
+      // ==================================
       // AUTH TIMEOUT
-      // ====================================
+      // ==================================
 
       const authTimeout =
         setTimeout(
           () => {
 
-            if (!authenticated) {
+            if (
+              !authenticated
+            ) {
 
               console.log(
-                "❌ Machine authentication timeout"
+                "❌ WebSocket authentication timeout"
               );
 
+
               try {
+
                 ws.close();
+
               } catch (_) {}
 
             }
@@ -93,9 +347,9 @@ function setupMachineSocket(server) {
         );
 
 
-      // ====================================
+      // ==================================
       // MESSAGE
-      // ====================================
+      // ==================================
 
       ws.on(
         "message",
@@ -110,19 +364,36 @@ function setupMachineSocket(server) {
 
 
             console.log(
-              "📡 Machine message:",
-              data
+              "📡 WebSocket message:",
+              data.type
             );
 
 
-            // ==================================
-            // AUTHENTICATION
-            // ==================================
+            // =================================
+            // MACHINE / RPI AUTHENTICATION
+            // =================================
 
             if (
               data.type ===
               "listener"
             ) {
+
+              // -----------------------------
+              // Prevent re-authentication
+              // -----------------------------
+
+              if (
+                authenticated
+              ) {
+
+                return;
+
+              }
+
+
+              connectionType =
+                "machine";
+
 
               listenerId =
                 data.listenerId ||
@@ -134,14 +405,17 @@ function setupMachineSocket(server) {
                 null;
 
 
-              // --------------------------------
+              // -----------------------------
               // LISTENER ID
-              // --------------------------------
+              // -----------------------------
 
-              if (!listenerId) {
+              if (
+                !listenerId
+              ) {
 
-                ws.send(
-                  JSON.stringify({
+                sendJson(
+                  ws,
+                  {
 
                     type:
                       "auth_error",
@@ -149,7 +423,7 @@ function setupMachineSocket(server) {
                     message:
                       "listenerId is required",
 
-                  })
+                  }
                 );
 
                 ws.close();
@@ -159,14 +433,17 @@ function setupMachineSocket(server) {
               }
 
 
-              // --------------------------------
+              // -----------------------------
               // MACHINE ID
-              // --------------------------------
+              // -----------------------------
 
-              if (!requestedMachineId) {
+              if (
+                !requestedMachineId
+              ) {
 
-                ws.send(
-                  JSON.stringify({
+                sendJson(
+                  ws,
+                  {
 
                     type:
                       "auth_error",
@@ -174,7 +451,7 @@ function setupMachineSocket(server) {
                     message:
                       "ESP32 machineId is required",
 
-                  })
+                  }
                 );
 
                 ws.close();
@@ -184,9 +461,9 @@ function setupMachineSocket(server) {
               }
 
 
-              // --------------------------------
-              // VERIFY LISTENER
-              // --------------------------------
+              // -----------------------------
+              // VERIFY RPI
+              // -----------------------------
 
               const valid =
                 verifyMachine(
@@ -203,8 +480,9 @@ function setupMachineSocket(server) {
                 );
 
 
-                ws.send(
-                  JSON.stringify({
+                sendJson(
+                  ws,
+                  {
 
                     type:
                       "auth_error",
@@ -212,9 +490,8 @@ function setupMachineSocket(server) {
                     message:
                       "Machine authentication failed",
 
-                  })
+                  }
                 );
-
 
                 ws.close();
 
@@ -237,7 +514,7 @@ function setupMachineSocket(server) {
 
 
               // =================================
-              // ACTUAL ESP32 ID
+              // SERVER-OWNED MACHINE ID
               // =================================
 
               machineId =
@@ -249,6 +526,7 @@ function setupMachineSocket(server) {
                 listenerId
               );
 
+
               console.log(
                 "🆔 ESP32 Machine ID:",
                 machineId
@@ -256,7 +534,7 @@ function setupMachineSocket(server) {
 
 
               // =================================
-              // DUPLICATE CONNECTION
+              // DUPLICATE MACHINE CONNECTION
               // =================================
 
               const existingConnection =
@@ -292,7 +570,7 @@ function setupMachineSocket(server) {
 
 
               // =================================
-              // REGISTER CONNECTION
+              // REGISTER MACHINE
               // =================================
 
               machineConnections.set(
@@ -302,13 +580,12 @@ function setupMachineSocket(server) {
 
 
               // =================================
-              // REGISTER RUNTIME MACHINE
+              // RUNTIME MACHINE
               // =================================
 
-              const machine =
-                registerMachine(
-                  machineId
-                );
+              registerMachine(
+                machineId
+              );
 
 
               console.log(
@@ -318,7 +595,7 @@ function setupMachineSocket(server) {
 
 
               // =================================
-              // GENERATE PAIRING CODE
+              // PAIRING CODE
               // =================================
 
               let pairing =
@@ -349,53 +626,49 @@ function setupMachineSocket(server) {
 
 
               // =================================
-              // AUTH SUCCESS
+              // AUTH RESPONSE
               // =================================
 
-              const authResponse = {
+              sendJson(
+                ws,
+                {
 
-                type:
-                  "auth_success",
+                  type:
+                    "auth_success",
 
-                message:
-                  "Machine authenticated successfully",
+                  message:
+                    "Machine authenticated successfully",
 
-                machineId,
+                  machineId,
 
-                listenerId,
+                  listenerId,
 
-                paired:
-                  pairing
-                    ? pairing.paired
-                    : false,
+                  paired:
+                    pairing
+                      ? pairing.paired
+                      : false,
 
-                pairingCode:
-                  pairing
-                    ? pairing.pairingCode
-                    : null,
+                  pairingCode:
+                    pairing
+                      ? pairing.pairingCode
+                      : null,
 
-                pairingCodeCreatedAt:
-                  pairing
-                    ? pairing.pairingCodeCreatedAt
-                    : null,
+                  pairingCodeCreatedAt:
+                    pairing
+                      ? pairing.pairingCodeCreatedAt
+                      : null,
 
-                expiresIn:
-                  pairing
-                    ? pairing.expiresIn
-                    : 0,
+                  expiresIn:
+                    pairing
+                      ? pairing.expiresIn
+                      : 0,
 
-              };
-
-
-              ws.send(
-                JSON.stringify(
-                  authResponse
-                )
+                }
               );
 
 
               console.log(
-                "📤 Auth success sent"
+                "📤 Machine auth success sent"
               );
 
 
@@ -404,11 +677,305 @@ function setupMachineSocket(server) {
             }
 
 
-            // ==================================
-            // BLOCK UNAUTHENTICATED
-            // ==================================
+            // =================================
+            // WEBSITE AUTHENTICATION
+            // =================================
+            //
+            // Website sends:
+            //
+            // {
+            //   type: "website_auth",
+            //   machineId: "...",
+            //   token: "Firebase ID token"
+            // }
+            //
+            // =================================
 
-            if (!authenticated) {
+            if (
+              data.type ===
+              "website_auth"
+            ) {
+
+              // -----------------------------
+              // Prevent re-authentication
+              // -----------------------------
+
+              if (
+                authenticated
+              ) {
+
+                return;
+
+              }
+
+
+              connectionType =
+                "website";
+
+
+              const requestedMachineId =
+                data.machineId ||
+                null;
+
+
+              const token =
+                data.token ||
+                null;
+
+
+              // -----------------------------
+              // MACHINE ID
+              // -----------------------------
+
+              if (
+                !requestedMachineId
+              ) {
+
+                sendJson(
+                  ws,
+                  {
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "machineId is required",
+
+                  }
+                );
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              // -----------------------------
+              // TOKEN
+              // -----------------------------
+
+              if (!token) {
+
+                sendJson(
+                  ws,
+                  {
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "Firebase authentication token is required",
+
+                  }
+                );
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              // =================================
+              // VERIFY FIREBASE TOKEN
+              // =================================
+
+              let decodedToken;
+
+
+              try {
+
+                decodedToken =
+                  await firebaseAuth.verifyIdToken(
+                    token
+                  );
+
+              } catch (error) {
+
+                console.log(
+                  "❌ Website Firebase authentication failed:",
+                  error.message
+                );
+
+
+                sendJson(
+                  ws,
+                  {
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "Invalid Firebase authentication token",
+
+                  }
+                );
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              const uid =
+                decodedToken.uid;
+
+
+              // =================================
+              // CHECK MACHINE OWNERSHIP
+              // =================================
+
+              const owner =
+                await checkMachineOwnership(
+                  requestedMachineId,
+                  uid
+                );
+
+
+              if (!owner) {
+
+                console.log(
+                  `🚫 Website machine access denied: ${uid} → ${requestedMachineId}`
+                );
+
+
+                sendJson(
+                  ws,
+                  {
+
+                    type:
+                      "auth_error",
+
+                    message:
+                      "You do not have access to this machine",
+
+                  }
+                );
+
+                ws.close();
+
+                return;
+
+              }
+
+
+              // =================================
+              // AUTHENTICATED WEBSITE
+              // =================================
+
+              authenticated =
+                true;
+
+
+              clearTimeout(
+                authTimeout
+              );
+
+
+              machineId =
+                requestedMachineId;
+
+
+              websiteUserId =
+                uid;
+
+
+              addWebsiteConnection(
+                machineId,
+                ws
+              );
+
+
+              // =================================
+              // WEBSITE AUTH SUCCESS
+              // =================================
+
+              sendJson(
+                ws,
+                {
+
+                  type:
+                    "website_auth_success",
+
+                  message:
+                    "Website authenticated successfully",
+
+                  machineId,
+
+                }
+              );
+
+
+              // =================================
+              // SEND CURRENT MACHINE RUNTIME
+              // =================================
+
+              const machineConnection =
+                machineConnections.get(
+                  machineId
+                );
+
+
+              if (
+                machineConnection &&
+                machineConnection.readyState ===
+                  WebSocket.OPEN
+              ) {
+
+                sendJson(
+                  ws,
+                  {
+
+                    type:
+                      "machine_connection",
+
+                    machineId,
+
+                    connected:
+                      true,
+
+                  }
+                );
+
+              } else {
+
+                sendJson(
+                  ws,
+                  {
+
+                    type:
+                      "machine_connection",
+
+                    machineId,
+
+                    connected:
+                      false,
+
+                  }
+                );
+
+              }
+
+
+              console.log(
+                `✅ Website authenticated: ${uid} → ${machineId}`
+              );
+
+
+              return;
+
+            }
+
+
+            // =================================
+            // BLOCK UNAUTHENTICATED
+            // =================================
+
+            if (
+              !authenticated
+            ) {
 
               console.log(
                 "⚠️ Unauthenticated message rejected"
@@ -419,13 +986,15 @@ function setupMachineSocket(server) {
             }
 
 
-            // ==================================
+            // =================================
             // MACHINE STATE
-            // ==================================
+            // =================================
 
             if (
               data.type ===
-              "machine_state"
+              "machine_state" &&
+              connectionType ===
+                "machine"
             ) {
 
               console.log(
@@ -433,7 +1002,7 @@ function setupMachineSocket(server) {
               );
 
 
-              // Force server-owned IDs
+              // Server owns identity
               const stateData = {
 
                 ...data,
@@ -459,18 +1028,89 @@ function setupMachineSocket(server) {
               );
 
 
+              // =================================
+              // BROADCAST TO WEBSITE
+              // =================================
+
+              broadcastToWebsite(
+                machineId,
+                {
+
+                  type:
+                    "machine_state",
+
+                  listenerId:
+                    machineId,
+
+                  state:
+                    stateData.state ||
+                    {},
+
+                  timestamp:
+                    stateData.timestamp ||
+                    new Date().toISOString(),
+
+                }
+              );
+
+
               return;
 
             }
 
 
-            // ==================================
-            // COMMAND ACK
-            // ==================================
+            // =================================
+            // MACHINE LOG
+            // =================================
 
             if (
               data.type ===
-              "command_ack"
+              "machine_log" &&
+              connectionType ===
+                "machine"
+            ) {
+
+              console.log(
+                `📝 Machine log [${machineId}]:`,
+                data.message ||
+                data.log
+              );
+
+
+              broadcastToWebsite(
+                machineId,
+                {
+
+                  type:
+                    "machine_log",
+
+                  message:
+                    data.message ||
+                    data.log ||
+                    "",
+
+                  timestamp:
+                    data.timestamp ||
+                    new Date().toISOString(),
+
+                }
+              );
+
+
+              return;
+
+            }
+
+
+            // =================================
+            // COMMAND ACK
+            // =================================
+
+            if (
+              data.type ===
+              "command_ack" &&
+              connectionType ===
+                "machine"
             ) {
 
               console.log(
@@ -479,9 +1119,7 @@ function setupMachineSocket(server) {
               );
 
 
-              // Server owns the machine identity.
-              // Never trust client-supplied machine ID.
-
+              // Server owns identity
               const ackData = {
 
                 ...data,
@@ -507,24 +1145,86 @@ function setupMachineSocket(server) {
               );
 
 
+              // =================================
+              // BROADCAST ACK
+              // =================================
+
+              broadcastToWebsite(
+                machineId,
+                {
+
+                  type:
+                    "command_ack",
+
+                  command:
+                    data.command,
+
+                  success:
+                    data.success,
+
+                  executed:
+                    data.executed,
+
+                  error:
+                    data.error ||
+                    null,
+
+                  timestamp:
+                    data.timestamp ||
+                    new Date().toISOString(),
+
+                }
+              );
+
+
               return;
 
             }
 
 
-            // ==================================
+            // =================================
+            // MACHINE DISCONNECT EVENT
+            // =================================
+
+            if (
+              data.type ===
+              "machine_disconnect" &&
+              connectionType ===
+                "machine"
+            ) {
+
+              broadcastToWebsite(
+                machineId,
+                {
+
+                  type:
+                    "machine_connection",
+
+                  connected:
+                    false,
+
+                }
+              );
+
+
+              return;
+
+            }
+
+
+            // =================================
             // UNKNOWN MESSAGE
-            // ==================================
+            // =================================
 
             console.log(
-              `⚠️ Unknown message from ${machineId}:`,
+              `⚠️ Unknown message from ${connectionType}:`,
               data.type
             );
 
           } catch (error) {
 
             console.error(
-              "❌ Invalid machine message:",
+              "❌ Invalid WebSocket message:",
               error.message
             );
 
@@ -550,7 +1250,7 @@ function setupMachineSocket(server) {
           if (!authenticated) {
 
             console.log(
-              "🔌 Unauthenticated connection closed"
+              "🔌 Unauthenticated WebSocket closed"
             );
 
             return;
@@ -558,36 +1258,93 @@ function setupMachineSocket(server) {
           }
 
 
-          console.log(
-            `🔌 Machine disconnected: ${machineId}`
-          );
-
-
-          // Only remove this socket if
-          // it is still the active socket.
+          // ==================================
+          // WEBSITE DISCONNECT
+          // ==================================
 
           if (
-            machineConnections.get(
-              machineId
-            ) === ws
+            connectionType ===
+            "website"
           ) {
 
-            machineConnections.delete(
-              machineId
+            removeWebsiteConnection(
+              machineId,
+              ws
             );
 
 
-            try {
+            console.log(
+              `🌐 Website session ended: ${websiteUserId} → ${machineId}`
+            );
 
-              await disconnectMachine(
+
+            return;
+
+          }
+
+
+          // ==================================
+          // MACHINE DISCONNECT
+          // ==================================
+
+          if (
+            connectionType ===
+            "machine"
+          ) {
+
+            console.log(
+              `🔌 Machine disconnected: ${machineId}`
+            );
+
+
+            // Only remove if this is
+            // still the active socket.
+
+            if (
+              machineConnections.get(
+                machineId
+              ) === ws
+            ) {
+
+              machineConnections.delete(
                 machineId
               );
 
-            } catch (error) {
 
-              console.error(
-                `❌ Failed to update disconnect state [${machineId}]:`,
-                error.message
+              try {
+
+                await disconnectMachine(
+                  machineId
+                );
+
+              } catch (error) {
+
+                console.error(
+                  `❌ Failed to update disconnect state [${machineId}]:`,
+                  error.message
+                );
+
+              }
+
+
+              // =================================
+              // INFORM WEBSITE
+              // =================================
+
+              broadcastToWebsite(
+                machineId,
+                {
+
+                  type:
+                    "machine_connection",
+
+                  connected:
+                    false,
+
+                  timestamp:
+                    new Date().toISOString(),
+
+                }
               );
 
             }
@@ -679,11 +1436,6 @@ function sendToMachine(
 
   try {
 
-    // ======================================
-    // SECURITY
-    // SERVER OWNS TARGET MACHINE ID
-    // ======================================
-
     const payload = {
 
       ...data,
@@ -741,7 +1493,7 @@ function isMachineConnected(
   return (
     ws !== undefined &&
     ws.readyState ===
-    WebSocket.OPEN
+      WebSocket.OPEN
   );
 
 }
@@ -767,6 +1519,32 @@ function getConnectedMachines() {
 function getConnectionCount() {
 
   return machineConnections.size;
+
+}
+
+
+// ========================================
+// GET WEBSITE CONNECTION COUNT
+// ========================================
+
+function getWebsiteConnectionCount(
+  machineId
+) {
+
+  const clients =
+    websiteConnections.get(
+      machineId
+    );
+
+
+  if (!clients) {
+
+    return 0;
+
+  }
+
+
+  return clients.size;
 
 }
 
@@ -839,6 +1617,8 @@ module.exports = {
   getConnectedMachines,
 
   getConnectionCount,
+
+  getWebsiteConnectionCount,
 
   disconnectMachineSocket,
 
