@@ -6,6 +6,7 @@ const verifyToken =
 const {
   getMachine,
   getAllMachines,
+  registerMachine,
   markCommandSent,
   checkMachineOwnership,
   createUserMachine,
@@ -18,8 +19,7 @@ const {
 } = require("../services/machineSocket");
 
 const {
-  generatePairingCode,
-  setPairingCode,
+  getMachine: getMachineFromDb,
   updateMachine,
 } = require("../services/machineRepository");
 
@@ -66,7 +66,9 @@ router.get(
           "Failed to get machines",
 
       });
+
     }
+
   }
 );
 
@@ -87,6 +89,10 @@ router.get(
       } = req.params;
 
 
+      // ==================================
+      // OWNERSHIP
+      // ==================================
+
       const owner =
         await checkMachineOwnership(
           machineId,
@@ -104,8 +110,13 @@ router.get(
             "You do not have access to this machine",
 
         });
+
       }
 
+
+      // ==================================
+      // RUNTIME MACHINE
+      // ==================================
 
       const machine =
         getMachine(
@@ -123,6 +134,7 @@ router.get(
             "Machine is not currently connected",
 
         });
+
       }
 
 
@@ -149,13 +161,392 @@ router.get(
           "Failed to get machine status",
 
       });
+
     }
+
   }
 );
 
 
 // ========================================
-// REGISTER MACHINE
+// PAIR MACHINE
+// ========================================
+//
+// Website sends:
+//
+// {
+//   machineId: "D885D1ABC31C",
+//   pairingCode: "977343"
+// }
+//
+// Server verifies:
+//
+// 1. Machine exists
+// 2. Machine is not already paired
+// 3. Pairing code matches
+// 4. Code is not expired
+// 5. Logged-in Firebase user becomes owner
+//
+// ========================================
+
+router.post(
+  "/pair",
+  verifyToken,
+  async (req, res) => {
+
+    try {
+
+      const {
+        machineId,
+        pairingCode,
+      } = req.body;
+
+
+      // ==================================
+      // VALIDATION
+      // ==================================
+
+      if (!machineId) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "machineId is required",
+
+        });
+
+      }
+
+
+      if (!pairingCode) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "pairingCode is required",
+
+        });
+
+      }
+
+
+      // ==================================
+      // NORMALIZE
+      // ==================================
+
+      const normalizedMachineId =
+        String(
+          machineId
+        ).trim();
+
+
+      const normalizedPairingCode =
+        String(
+          pairingCode
+        ).trim();
+
+
+      // ==================================
+      // VALIDATE CODE FORMAT
+      // ==================================
+
+      if (
+        !/^\d{6}$/.test(
+          normalizedPairingCode
+        )
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Pairing code must be exactly 6 digits",
+
+        });
+
+      }
+
+
+      // ==================================
+      // GET MACHINE
+      // ==================================
+
+      const machine =
+        await getMachineFromDb(
+          normalizedMachineId
+        );
+
+
+      if (!machine) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message:
+            "Machine not found",
+
+        });
+
+      }
+
+
+      // ==================================
+      // ALREADY PAIRED
+      // ==================================
+
+      if (
+        machine.paired === true ||
+        machine.ownerId
+      ) {
+
+        // Same user already owns it
+        if (
+          machine.ownerId ===
+          req.user.uid
+        ) {
+
+          return res.status(200).json({
+
+            success: true,
+
+            alreadyPaired: true,
+
+            message:
+              "Machine is already paired with your account",
+
+            machine: {
+
+              ...machine,
+
+              pairingCode:
+                null,
+
+            },
+
+          });
+
+        }
+
+
+        return res.status(409).json({
+
+          success: false,
+
+          message:
+            "Machine is already paired with another account",
+
+        });
+
+      }
+
+
+      // ==================================
+      // CHECK PAIRING CODE EXISTS
+      // ==================================
+
+      if (
+        !machine.pairingCode ||
+        !machine.pairingCodeCreatedAt
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Machine does not have an active pairing code",
+
+        });
+
+      }
+
+
+      // ==================================
+      // CHECK CODE
+      // ==================================
+
+      if (
+        String(
+          machine.pairingCode
+        ) !==
+        normalizedPairingCode
+      ) {
+
+        return res.status(401).json({
+
+          success: false,
+
+          message:
+            "Invalid pairing code",
+
+        });
+
+      }
+
+
+      // ==================================
+      // CHECK EXPIRY
+      // ==================================
+
+      const createdAt =
+        new Date(
+          machine.pairingCodeCreatedAt
+        ).getTime();
+
+
+      if (
+        Number.isNaN(
+          createdAt
+        )
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Invalid pairing code timestamp",
+
+        });
+
+      }
+
+
+      // 10 minutes
+      const PAIRING_CODE_LIFETIME =
+        10 * 60 * 1000;
+
+
+      const now =
+        Date.now();
+
+
+      const expired =
+        now -
+        createdAt >
+        PAIRING_CODE_LIFETIME;
+
+
+      if (expired) {
+
+        return res.status(410).json({
+
+          success: false,
+
+          message:
+            "Pairing code has expired. Generate a new code from the machine.",
+
+        });
+
+      }
+
+
+      // ==================================
+      // PAIR MACHINE
+      // ==================================
+
+      const updatedMachine =
+        await updateMachine(
+
+          normalizedMachineId,
+
+          {
+
+            ownerId:
+              req.user.uid,
+
+            paired:
+              true,
+
+            // Code is single-use
+            pairingCode:
+              null,
+
+            pairingCodeCreatedAt:
+              null,
+
+            pairedAt:
+              new Date().toISOString(),
+
+          }
+
+        );
+
+
+      // ==================================
+      // SUCCESS
+      // ==================================
+
+      console.log(
+        `🔗 Machine paired successfully: ${normalizedMachineId} → ${req.user.uid}`
+      );
+
+
+      return res.status(200).json({
+
+        success: true,
+
+        message:
+          "Machine paired successfully",
+
+        machine: {
+
+          machineId:
+            updatedMachine.machineId,
+
+          ownerId:
+            updatedMachine.ownerId,
+
+          name:
+            updatedMachine.name,
+
+          paired:
+            updatedMachine.paired,
+
+          connected:
+            updatedMachine.connected,
+
+          status:
+            updatedMachine.status,
+
+          firmwareVersion:
+            updatedMachine.firmwareVersion,
+
+        },
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Machine pairing error:",
+        error.message
+      );
+
+
+      return res.status(500).json({
+
+        success: false,
+
+        message:
+          "Failed to pair machine",
+
+      });
+
+    }
+
+  }
+);
+
+
+// ========================================
+// CREATE / REGISTER MACHINE
 // ========================================
 
 router.post(
@@ -181,13 +572,16 @@ router.post(
             "machineId is required",
 
         });
+
       }
 
 
+      // ==================================
+      // CHECK EXISTING MACHINE
+      // ==================================
+
       const existing =
-        await require(
-          "../services/machineRepository"
-        ).getMachine(
+        await getMachineFromDb(
           machineId
         );
 
@@ -202,8 +596,13 @@ router.post(
             "Machine is already registered",
 
         });
+
       }
 
+
+      // ==================================
+      // CREATE
+      // ==================================
 
       const machine =
         await createUserMachine(
@@ -236,6 +635,7 @@ router.post(
         error.message
       );
 
+
       res.status(500).json({
 
         success: false,
@@ -244,372 +644,9 @@ router.post(
           "Failed to register machine",
 
       });
+
     }
-  }
-);
 
-
-// ========================================
-// GENERATE PAIRING CODE
-// ========================================
-
-router.post(
-  "/pairing-code",
-  verifyToken,
-  async (req, res) => {
-
-    try {
-
-      const {
-        machineId,
-      } = req.body;
-
-
-      if (!machineId) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "machineId is required",
-
-        });
-      }
-
-
-      const machine =
-        await getMachine(
-          machineId
-        );
-
-
-      if (!machine) {
-
-        return res.status(404).json({
-
-          success: false,
-
-          message:
-            "Machine not found",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // Already paired
-      // ----------------------------------------
-
-      if (machine.paired) {
-
-        return res.status(409).json({
-
-          success: false,
-
-          message:
-            "Machine is already paired",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // Generate code
-      // ----------------------------------------
-
-      const pairingCode =
-        generatePairingCode();
-
-
-      const updatedMachine =
-        await setPairingCode(
-          machineId,
-          pairingCode
-        );
-
-
-      console.log(
-        `🔐 Pairing code generated for ${machineId}`
-      );
-
-
-      res.json({
-
-        success: true,
-
-        machineId,
-
-        pairingCode,
-
-        pairingCodeCreatedAt:
-          updatedMachine
-            .pairingCodeCreatedAt,
-
-      });
-
-    } catch (error) {
-
-      console.error(
-        "Pairing code error:",
-        error.message
-      );
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Failed to generate pairing code",
-
-      });
-    }
-  }
-);
-
-
-// ========================================
-// PAIR MACHINE
-// ========================================
-
-router.post(
-  "/pair",
-  verifyToken,
-  async (req, res) => {
-
-    try {
-
-      const {
-        machineId,
-        pairingCode,
-      } = req.body;
-
-
-      // ----------------------------------------
-      // VALIDATION
-      // ----------------------------------------
-
-      if (!machineId) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "machineId is required",
-
-        });
-      }
-
-
-      if (!pairingCode) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "pairingCode is required",
-
-        });
-      }
-
-
-      if (
-        !/^\d{6}$/.test(
-          String(pairingCode)
-        )
-      ) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "Pairing code must be exactly 6 digits",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // GET MACHINE
-      // ----------------------------------------
-
-      const machine =
-        await getMachine(
-          machineId
-        );
-
-
-      if (!machine) {
-
-        return res.status(404).json({
-
-          success: false,
-
-          message:
-            "Machine not found",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // ALREADY PAIRED
-      // ----------------------------------------
-
-      if (machine.paired) {
-
-        return res.status(409).json({
-
-          success: false,
-
-          message:
-            "Machine is already paired",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // CHECK CODE
-      // ----------------------------------------
-
-      if (
-        machine.pairingCode
-        !== String(pairingCode)
-      ) {
-
-        return res.status(401).json({
-
-          success: false,
-
-          message:
-            "Invalid pairing code",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // CODE EXPIRATION
-      // ----------------------------------------
-
-      if (
-        !machine.pairingCodeCreatedAt
-      ) {
-
-        return res.status(401).json({
-
-          success: false,
-
-          message:
-            "Pairing code has expired",
-
-        });
-      }
-
-
-      const createdAt =
-        new Date(
-          machine.pairingCodeCreatedAt
-        ).getTime();
-
-
-      const now =
-        Date.now();
-
-
-      const age =
-        now - createdAt;
-
-
-      const TEN_MINUTES =
-        10 * 60 * 1000;
-
-
-      if (
-        age < 0
-        || age > TEN_MINUTES
-      ) {
-
-        return res.status(401).json({
-
-          success: false,
-
-          message:
-            "Pairing code has expired",
-
-        });
-      }
-
-
-      // ----------------------------------------
-      // PAIR MACHINE
-      // ----------------------------------------
-
-      const updatedMachine =
-        await updateMachine(
-
-          machineId,
-
-          {
-
-            ownerId:
-              req.user.uid,
-
-            paired:
-              true,
-
-            pairingCode:
-              null,
-
-            pairingCodeCreatedAt:
-              null,
-
-          }
-
-        );
-
-
-      console.log(
-        `🔗 Machine paired: ${machineId} → ${req.user.uid}`
-      );
-
-
-      // ----------------------------------------
-      // RESPONSE
-      // ----------------------------------------
-
-      res.json({
-
-        success: true,
-
-        message:
-          "Machine paired successfully",
-
-        machine:
-          updatedMachine,
-
-      });
-
-    } catch (error) {
-
-      console.error(
-        "Machine pairing error:",
-        error.message
-      );
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Failed to pair machine",
-
-      });
-    }
   }
 );
 
@@ -631,9 +668,9 @@ router.post(
       } = req.body;
 
 
-      // ----------------------------------------
+      // ==================================
       // VALIDATION
-      // ----------------------------------------
+      // ==================================
 
       if (!machineId) {
 
@@ -645,6 +682,7 @@ router.post(
             "machineId is required",
 
         });
+
       }
 
 
@@ -658,12 +696,13 @@ router.post(
             "command is required",
 
         });
+
       }
 
 
-      // ----------------------------------------
+      // ==================================
       // OWNERSHIP
-      // ----------------------------------------
+      // ==================================
 
       const owner =
         await checkMachineOwnership(
@@ -687,12 +726,13 @@ router.post(
             "You do not have access to this machine",
 
         });
+
       }
 
 
-      // ----------------------------------------
+      // ==================================
       // CONNECTION
-      // ----------------------------------------
+      // ==================================
 
       if (
         !isMachineConnected(
@@ -710,12 +750,13 @@ router.post(
           machineId,
 
         });
+
       }
 
 
-      // ----------------------------------------
+      // ==================================
       // SEND COMMAND
-      // ----------------------------------------
+      // ==================================
 
       const sent =
         sendToMachine(
@@ -727,13 +768,10 @@ router.post(
             type:
               "command",
 
-            machineId,
-
             command,
 
             timestamp:
-              new Date()
-                .toISOString(),
+              new Date().toISOString(),
 
             requestedBy:
               req.user.uid,
@@ -755,12 +793,13 @@ router.post(
           machineId,
 
         });
+
       }
 
 
-      // ----------------------------------------
+      // ==================================
       // UPDATE COMMAND STATE
-      // ----------------------------------------
+      // ==================================
 
       await markCommandSent(
 
@@ -771,9 +810,9 @@ router.post(
       );
 
 
-      // ----------------------------------------
+      // ==================================
       // RESPONSE
-      // ----------------------------------------
+      // ==================================
 
       res.json({
 
@@ -807,7 +846,9 @@ router.post(
           "Failed to send machine command",
 
       });
+
     }
+
   }
 );
 
@@ -816,4 +857,5 @@ router.post(
 // EXPORT
 // ========================================
 
-module.exports = router;
+module.exports =
+  router;
