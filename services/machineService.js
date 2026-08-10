@@ -5,22 +5,24 @@ const {
   isMachineOwner,
   getMachinesByOwner,
   deleteMachine,
+  generatePairingCode,
+  setPairingCode,
 } = require("./machineRepository");
 
 
 // ========================================
 // RUNTIME MACHINE STATE
 // ========================================
-//
-// IMPORTANT:
-// Har machine ka state apne machineId ke andar
-// separately stored rahega.
-//
-// Machine A ka state kabhi Machine B ke state
-// ke comparison me use nahi hoga.
-//
 
 const machines = new Map();
+
+
+// ========================================
+// PAIRING CODE EXPIRY
+// ========================================
+
+const PAIRING_CODE_EXPIRY_MS =
+  10 * 60 * 1000; // 10 minutes
 
 
 // ========================================
@@ -83,14 +85,8 @@ function registerMachine(
 
 
   let machine =
-    machines.get(
-      machineId
-    );
+    machines.get(machineId);
 
-
-  // ======================================
-  // NEW MACHINE
-  // ======================================
 
   if (!machine) {
 
@@ -139,20 +135,10 @@ function registerMachine(
 
     };
 
-  }
-
-
-  // ======================================
-  // EXISTING MACHINE
-  // ======================================
-
-  else {
+  } else {
 
     machine.connected =
       true;
-
-    // Don't unnecessarily overwrite
-    // actual machine status here.
 
     if (
       machine.status ===
@@ -181,15 +167,327 @@ function registerMachine(
 
 
 // ========================================
+// GENERATE / REFRESH PAIRING CODE
+// ========================================
+
+async function createMachinePairingCode(
+  machineId
+) {
+
+  if (!machineId) {
+
+    throw new Error(
+      "machineId is required"
+    );
+
+  }
+
+
+  const machine =
+    await getMachineFromDb(
+      machineId
+    );
+
+
+  if (!machine) {
+
+    throw new Error(
+      `Machine not found: ${machineId}`
+    );
+
+  }
+
+
+  // ======================================
+  // DON'T GENERATE FOR ALREADY PAIRED MACHINE
+  // ======================================
+
+  if (
+    machine.paired === true &&
+    machine.ownerId
+  ) {
+
+    return {
+      machineId,
+
+      paired: true,
+
+      pairingCode: null,
+
+      message:
+        "Machine is already paired",
+
+    };
+
+  }
+
+
+  const pairingCode =
+    generatePairingCode();
+
+
+  const createdAt =
+    new Date().toISOString();
+
+
+  await setPairingCode(
+    machineId,
+    pairingCode
+  );
+
+
+  // Keep runtime info if machine
+  // is currently connected.
+
+  const runtime =
+    machines.get(machineId);
+
+
+  if (runtime) {
+
+    runtime.pairingCode =
+      pairingCode;
+
+    runtime.pairingCodeCreatedAt =
+      createdAt;
+
+    machines.set(
+      machineId,
+      runtime
+    );
+
+  }
+
+
+  console.log(
+    `🔐 Pairing code generated [${machineId}]`
+  );
+
+
+  return {
+
+    machineId,
+
+    paired: false,
+
+    pairingCode,
+
+    pairingCodeCreatedAt:
+      createdAt,
+
+    expiresIn:
+      PAIRING_CODE_EXPIRY_MS,
+
+  };
+
+}
+
+
+// ========================================
+// GET PAIRING INFORMATION
+// ========================================
+
+async function getMachinePairingInfo(
+  machineId
+) {
+
+  const machine =
+    await getMachineFromDb(
+      machineId
+    );
+
+
+  if (!machine) {
+
+    throw new Error(
+      `Machine not found: ${machineId}`
+    );
+
+  }
+
+
+  return {
+
+    machineId,
+
+    paired:
+      machine.paired === true,
+
+    ownerId:
+      machine.ownerId ||
+      null,
+
+    pairingCode:
+      machine.pairingCode ||
+      null,
+
+    pairingCodeCreatedAt:
+      machine.pairingCodeCreatedAt ||
+      null,
+
+  };
+
+}
+
+
+// ========================================
+// PAIR MACHINE WITH USER
+// ========================================
+
+async function pairMachine(
+  machineId,
+  ownerId,
+  pairingCode
+) {
+
+  if (!machineId) {
+
+    throw new Error(
+      "machineId is required"
+    );
+
+  }
+
+  if (!ownerId) {
+
+    throw new Error(
+      "ownerId is required"
+    );
+
+  }
+
+  if (!pairingCode) {
+
+    throw new Error(
+      "pairingCode is required"
+    );
+
+  }
+
+
+  const machine =
+    await getMachineFromDb(
+      machineId
+    );
+
+
+  if (!machine) {
+
+    throw new Error(
+      "Machine not found"
+    );
+
+  }
+
+
+  // ======================================
+  // ALREADY PAIRED
+  // ======================================
+
+  if (
+    machine.paired === true &&
+    machine.ownerId
+  ) {
+
+    throw new Error(
+      "Machine is already paired"
+    );
+
+  }
+
+
+  // ======================================
+  // CODE CHECK
+  // ======================================
+
+  if (
+    machine.pairingCode !==
+    String(pairingCode)
+  ) {
+
+    throw new Error(
+      "Invalid pairing code"
+    );
+
+  }
+
+
+  // ======================================
+  // EXPIRY CHECK
+  // ======================================
+
+  if (
+    !machine.pairingCodeCreatedAt
+  ) {
+
+    throw new Error(
+      "Pairing code is invalid"
+    );
+
+  }
+
+
+  const createdAt =
+    new Date(
+      machine.pairingCodeCreatedAt
+    ).getTime();
+
+
+  const now =
+    Date.now();
+
+
+  if (
+    Number.isNaN(createdAt) ||
+    now - createdAt >
+      PAIRING_CODE_EXPIRY_MS
+  ) {
+
+    throw new Error(
+      "Pairing code has expired"
+    );
+
+  }
+
+
+  // ======================================
+  // PAIR MACHINE
+  // ======================================
+
+  await updateMachineInDb(
+    machineId,
+    {
+
+      ownerId,
+
+      paired:
+        true,
+
+      pairingCode:
+        null,
+
+      pairingCodeCreatedAt:
+        null,
+
+    }
+  );
+
+
+  console.log(
+    `🔗 Machine paired [${machineId}] → ${ownerId}`
+  );
+
+
+  return await getMachineFromDb(
+    machineId
+  );
+
+}
+
+
+// ========================================
 // BUILD PERSISTENT STATE SNAPSHOT
 // ========================================
-//
-// IMPORTANT:
-// Timestamp is NOT included.
-//
-// Otherwise every packet would look different
-// because lastMachineStateAt changes.
-//
 
 function getPersistentState(
   machine
@@ -278,32 +576,27 @@ async function updateMachineState(
   }
 
 
+  // IMPORTANT:
+  // machineId must represent the
+  // actual ESP32 machine identity.
+
   const machineId =
+    data.machineId ||
     data.listenerId;
 
 
   if (!machineId) {
 
     throw new Error(
-      "listenerId is required"
+      "machineId is required"
     );
 
   }
 
 
-  // ======================================
-  // GET PREVIOUS MACHINE
-  // ======================================
-
   let machine =
-    machines.get(
-      machineId
-    );
+    machines.get(machineId);
 
-
-  // ======================================
-  // CREATE RUNTIME MACHINE IF REQUIRED
-  // ======================================
 
   if (!machine) {
 
@@ -311,18 +604,11 @@ async function updateMachineState(
       machineId
     );
 
-
     machine =
-      machines.get(
-        machineId
-      );
+      machines.get(machineId);
 
   }
 
-
-  // ======================================
-  // SAVE PREVIOUS STATE
-  // ======================================
 
   const previousMachine = {
     ...machine,
@@ -332,10 +618,6 @@ async function updateMachineState(
   const state =
     data.state || {};
 
-
-  // ======================================
-  // CONNECTION
-  // ======================================
 
   if (
     typeof state.connected ===
@@ -348,10 +630,6 @@ async function updateMachineState(
   }
 
 
-  // ======================================
-  // DISPATCHER
-  // ======================================
-
   if (
     typeof state.dispatcherReady ===
     "boolean"
@@ -362,10 +640,6 @@ async function updateMachineState(
 
   }
 
-
-  // ======================================
-  // SAW
-  // ======================================
 
   if (
     typeof state.sawReady ===
@@ -378,10 +652,6 @@ async function updateMachineState(
   }
 
 
-  // ======================================
-  // FIRMWARE
-  // ======================================
-
   if (
     state.firmwareVersion !==
     undefined
@@ -392,10 +662,6 @@ async function updateMachineState(
 
   }
 
-
-  // ======================================
-  // MACHINE STATE
-  // ======================================
 
   if (
     state.machineState !==
@@ -420,10 +686,6 @@ async function updateMachineState(
   }
 
 
-  // ======================================
-  // EMERGENCY
-  // ======================================
-
   if (
     typeof state.emergency ===
     "boolean"
@@ -435,28 +697,16 @@ async function updateMachineState(
   }
 
 
-  // ======================================
-  // TIMESTAMP
-  // ======================================
-
   machine.lastMachineStateAt =
     data.timestamp ||
     new Date().toISOString();
 
-
-  // ======================================
-  // SAVE RUNTIME STATE
-  // ======================================
 
   machines.set(
     machineId,
     machine
   );
 
-
-  // ======================================
-  // CHECK ACTUAL STATE CHANGE
-  // ======================================
 
   const changed =
     hasStateChanged(
@@ -465,20 +715,11 @@ async function updateMachineState(
     );
 
 
-  // ======================================
-  // NO CHANGE
-  // ======================================
-  //
-  // Runtime state update ho gaya,
-  // lekin Firestore write ki zarurat nahi.
-  //
-
   if (!changed) {
 
     console.log(
       `⏭️ No persistent state change [${machineId}] — Firestore write skipped`
     );
-
 
     return {
       ...machine,
@@ -487,23 +728,10 @@ async function updateMachineState(
   }
 
 
-  // ======================================
-  // STATE CHANGED
-  // ======================================
-
   console.log(
     `🔄 Persistent machine state changed [${machineId}]`
   );
 
-
-  console.log(
-    getPersistentState(machine)
-  );
-
-
-  // ======================================
-  // FIRESTORE WRITE
-  // ======================================
 
   try {
 
@@ -546,9 +774,7 @@ async function markCommandSent(
 ) {
 
   const machine =
-    machines.get(
-      machineId
-    );
+    machines.get(machineId);
 
 
   if (!machine) {
@@ -559,10 +785,6 @@ async function markCommandSent(
 
   }
 
-
-  // ======================================
-  // UPDATE RUNTIME
-  // ======================================
 
   machine.lastCommand =
     command;
@@ -579,10 +801,6 @@ async function markCommandSent(
     machine
   );
 
-
-  // ======================================
-  // PERSIST COMMAND
-  // ======================================
 
   try {
 
@@ -601,7 +819,6 @@ async function markCommandSent(
 
       }
     );
-
 
   } catch (error) {
 
@@ -638,22 +855,21 @@ async function markCommandAck(
 
 
   const machineId =
+    data.machineId ||
     data.listenerId;
 
 
   if (!machineId) {
 
     throw new Error(
-      "listenerId is required"
+      "machineId is required"
     );
 
   }
 
 
   const machine =
-    machines.get(
-      machineId
-    );
+    machines.get(machineId);
 
 
   if (!machine) {
@@ -664,10 +880,6 @@ async function markCommandAck(
 
   }
 
-
-  // ======================================
-  // ACK DATA
-  // ======================================
 
   machine.lastAck = {
 
@@ -704,10 +916,6 @@ async function markCommandAck(
   );
 
 
-  // ======================================
-  // PERSIST ACK
-  // ======================================
-
   try {
 
     await updateMachineInDb(
@@ -725,7 +933,6 @@ async function markCommandAck(
 
       }
     );
-
 
   } catch (error) {
 
@@ -753,9 +960,7 @@ async function disconnectMachine(
 ) {
 
   const machine =
-    machines.get(
-      machineId
-    );
+    machines.get(machineId);
 
 
   if (!machine) {
@@ -764,10 +969,6 @@ async function disconnectMachine(
 
   }
 
-
-  // ======================================
-  // CHECK WHETHER ALREADY OFFLINE
-  // ======================================
 
   const wasConnected =
     machine.connected;
@@ -786,20 +987,11 @@ async function disconnectMachine(
   );
 
 
-  // ======================================
-  // ALREADY OFFLINE
-  // ======================================
-  //
-  // Firebase ko duplicate offline write
-  // nahi karni.
-  //
-
   if (!wasConnected) {
 
     console.log(
       `⏭️ Machine already offline [${machineId}] — Firestore write skipped`
     );
-
 
     return {
       ...machine,
@@ -807,10 +999,6 @@ async function disconnectMachine(
 
   }
 
-
-  // ======================================
-  // FIRESTORE
-  // ======================================
 
   try {
 
@@ -831,7 +1019,6 @@ async function disconnectMachine(
     console.log(
       `🔌 Machine marked offline [${machineId}]`
     );
-
 
   } catch (error) {
 
@@ -926,18 +1113,10 @@ async function deleteUserMachine(
   }
 
 
-  // ======================================
-  // REMOVE RUNTIME STATE
-  // ======================================
-
   machines.delete(
     machineId
   );
 
-
-  // ======================================
-  // REMOVE FIRESTORE RECORD
-  // ======================================
 
   await deleteMachine(
     machineId
@@ -978,5 +1157,11 @@ module.exports = {
   getUserMachines,
 
   deleteUserMachine,
+
+  createMachinePairingCode,
+
+  getMachinePairingInfo,
+
+  pairMachine,
 
 };
