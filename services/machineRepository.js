@@ -3,7 +3,6 @@ const { db } = require("./firebase");
 const machinesCollection =
   db.collection("machines");
 
-
 // ========================================
 // GET MACHINE
 // ========================================
@@ -38,7 +37,6 @@ function generatePairingCode() {
       Math.random() * 900000
     )
   );
-
 }
 
 
@@ -63,23 +61,34 @@ async function setPairingCode(
     );
   }
 
+  if (!/^\d{6}$/.test(pairingCode)) {
+    throw new Error(
+      "pairingCode must be exactly 6 digits"
+    );
+  }
+
+  const machine =
+    await getMachine(machineId);
+
+  if (!machine) {
+    throw new Error(
+      "Machine not found"
+    );
+  }
+
   await updateMachine(
     machineId,
     {
-
       pairingCode,
 
       pairingCodeCreatedAt:
         new Date().toISOString(),
 
       paired: false,
-
     }
   );
 
-  return getMachine(
-    machineId
-  );
+  return getMachine(machineId);
 }
 
 
@@ -94,11 +103,9 @@ async function createMachine(
 ) {
 
   if (!machineId) {
-
     throw new Error(
       "machineId is required"
     );
-
   }
 
   const machineRef =
@@ -109,11 +116,9 @@ async function createMachine(
     await machineRef.get();
 
   if (existing.exists) {
-
     throw new Error(
       "Machine already exists"
     );
-
   }
 
   const now =
@@ -151,9 +156,7 @@ async function createMachine(
     createdAt: now,
 
     updatedAt: now,
-
   };
-
 
   await machineRef.set(
     machine
@@ -173,43 +176,32 @@ async function updateMachine(
 ) {
 
   if (!machineId) {
-
     throw new Error(
       "machineId is required"
     );
-
   }
 
   if (!updates) {
-
     throw new Error(
       "updates are required"
     );
-
   }
 
   const machineRef =
     machinesCollection
       .doc(machineId);
 
-
   await machineRef.set(
-
     {
-
       ...updates,
 
       updatedAt:
         new Date().toISOString(),
-
     },
-
     {
       merge: true,
     }
-
   );
-
 
   return getMachine(
     machineId
@@ -240,8 +232,7 @@ async function isMachineOwner(
   }
 
   return (
-    machine.ownerId ===
-    ownerId
+    machine.ownerId === ownerId
   );
 }
 
@@ -267,15 +258,10 @@ async function getMachinesByOwner(
       )
       .get();
 
-
   return snapshot.docs.map(
     (doc) => ({
-
-      machineId:
-        doc.id,
-
+      machineId: doc.id,
       ...doc.data(),
-
     })
   );
 }
@@ -290,11 +276,9 @@ async function deleteMachine(
 ) {
 
   if (!machineId) {
-
     throw new Error(
       "machineId is required"
     );
-
   }
 
   await machinesCollection
