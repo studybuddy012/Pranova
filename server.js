@@ -4,11 +4,48 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 
+// ========================================
+// MACHINE SOCKET
+// ========================================
+
+const machineSocket =
+  require("./services/machineSocket");
+
+console.log(
+  "🔍 Machine Socket exports:",
+  Object.keys(machineSocket)
+);
+
 const {
   setupMachineSocket,
-  sendToMachine,
-  isMachineConnected,
-} = require("./services/machineSocket");
+} = machineSocket;
+
+
+// ========================================
+// VALIDATE SOCKET MODULE
+// ========================================
+
+if (
+  typeof setupMachineSocket !==
+  "function"
+) {
+
+  console.error(
+    "❌ setupMachineSocket was not found in ./services/machineSocket"
+  );
+
+  console.error(
+    "Available exports:",
+    Object.keys(machineSocket)
+  );
+
+  process.exit(1);
+}
+
+
+// ========================================
+// OTHER SERVICES
+// ========================================
 
 const verifyToken =
   require("./middleware/auth");
@@ -24,7 +61,8 @@ const jobsRoutes =
 // APP
 // ========================================
 
-const app = express();
+const app =
+  express();
 
 const PORT =
   process.env.PORT || 5000;
@@ -34,7 +72,9 @@ const PORT =
 // MIDDLEWARE
 // ========================================
 
-app.use(cors());
+app.use(
+  cors()
+);
 
 app.use(
   express.json()
@@ -144,8 +184,16 @@ const server =
 // MACHINE WEBSOCKET
 // ========================================
 
+console.log(
+  "🔌 Initializing machine WebSocket..."
+);
+
 setupMachineSocket(
   server
+);
+
+console.log(
+  "✅ Machine WebSocket initialized"
 );
 
 
@@ -159,7 +207,15 @@ server.listen(
   () => {
 
     console.log(
-      `🚀 PRANOVA Server running on port ${PORT}`
+      "========================================"
+    );
+
+    console.log(
+      "🚀 PRANOVA AlphaCut Server"
+    );
+
+    console.log(
+      `🌐 Port: ${PORT}`
     );
 
     console.log(
@@ -168,6 +224,56 @@ server.listen(
 
     console.log(
       "🔌 Machine WebSocket ready"
+    );
+
+    console.log(
+      "========================================"
+    );
+
+  }
+);
+
+
+// ========================================
+// SERVER ERROR
+// ========================================
+
+server.on(
+  "error",
+  (error) => {
+
+    console.error(
+      "❌ HTTP server error:",
+      error
+    );
+
+  }
+);
+
+
+// ========================================
+// PROCESS ERROR
+// ========================================
+
+process.on(
+  "uncaughtException",
+  (error) => {
+
+    console.error(
+      "❌ Uncaught exception:",
+      error
+    );
+
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (error) => {
+
+    console.error(
+      "❌ Unhandled rejection:",
+      error
     );
 
   }
