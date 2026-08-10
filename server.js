@@ -6,14 +6,18 @@ const http = require("http");
 
 const {
   setupMachineSocket,
-  sendToRpi,
-  isRpiConnected,
+  sendToMachine,
+  isMachineConnected,
 } = require("./services/machineSocket");
 
-const verifyToken = require("./middleware/auth");
+const verifyToken =
+  require("./middleware/auth");
 
-const machineRoutes = require("./routes/machine");
-const jobsRoutes = require("./routes/jobs");
+const machineRoutes =
+  require("./routes/machine");
+
+const jobsRoutes =
+  require("./routes/jobs");
 
 
 // ========================================
@@ -56,18 +60,21 @@ app.use(
 // ROOT
 // ========================================
 
-app.get("/", (req, res) => {
+app.get(
+  "/",
+  (req, res) => {
 
-  res.json({
+    res.json({
 
-    success: true,
+      success: true,
 
-    message:
-      "PRANOVA AlphaCut Server is running",
+      message:
+        "PRANOVA AlphaCut Server is running",
 
-  });
+    });
 
-});
+  }
+);
 
 
 // ========================================
@@ -82,9 +89,11 @@ app.get(
 
       success: true,
 
-      server: "online",
+      server:
+        "online",
 
-      firebase: "connected",
+      firebase:
+        "connected",
 
       timestamp:
         new Date().toISOString(),
@@ -135,7 +144,9 @@ const server =
 // MACHINE WEBSOCKET
 // ========================================
 
-setupMachineSocket(server);
+setupMachineSocket(
+  server
+);
 
 
 // ========================================
